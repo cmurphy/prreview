@@ -139,7 +139,7 @@ func generateReview(ctx context.Context, details PRDetails, commits, diffText, a
 		customInstructions = fmt.Sprintf("\n### SPECIAL INSTRUCTIONS FROM THE REVIEWER:\nPlease pay special attention to the following concern/question when reviewing this PR:\n\"%s\"\n", customPrompt)
 	}
 
-	prompt := fmt.Sprintf(`You are an expert Senior Software Engineer tasked with reviewing a pull request. Your goal is to provide constructive, actionable, and highly focused feedback.
+	prompt := fmt.Sprintf(`You are an expert Senior Software Engineer and Technical Writer tasked with reviewing a pull request. Your goal is to provide constructive, actionable, and highly focused feedback.
 
 Your tone should be collaborative and objective. You are providing feedback to a human developer, so be respectful but direct.
 
@@ -147,17 +147,20 @@ I will provide you with the PR Title, the PR Description, the Commit Messages, a
 
 ### INSTRUCTIONS:
 1.  **Analyze Intent:** Read the PR Title, Description, and Commits first. Understand what the author is *trying* to accomplish.
-2.  **Dynamic Language Detection:** Identify the programming languages and frameworks being used based on the file paths and extensions in the diff. Apply the standard, recognized best practices and idiomatic patterns for those specific languages (e.g., idiomatic error handling in Go, Pythonic list comprehensions, or safe memory management in Rust).
+2.  **Context Switching (Code vs. Docs):** Look at the file extensions in the diff.
+    *   **If evaluating Code (e.g., .go, .js, .py):** Apply standard best practices for that language. Focus on logic errors, security vulnerabilities, performance bottlenecks, and anti-patterns.
+    *   **If evaluating Documentation (e.g., .md, .mdx, .txt):** Shift your focus to **Technical Correctness** (are the code snippets, commands, and claims accurate?) and **Effective Communication** (is the explanation clear, concise, well-structured, and easy for the target audience to understand?).
 3.  **Review the Diff:** Evaluate the code changes against the author's stated intent. Does the code actually do what they claim?
-4.  **Focus on High-Impact Issues:**
+4.  **Focus on High-Impact Issues (Code Only):**
     *   Logic errors, race conditions, or unhandled edge cases.
     *   Security vulnerabilities (e.g., injection flaws, poor data sanitization).
     *   Significant performance bottlenecks.
     *   Anti-patterns or deviations from standard language-specific conventions.
-5.  **Evaluate Testing:** Check if the PR includes updates to test files. If core logic was changed or added without corresponding tests, flag it. Specifically recommend whether a **Unit Test** (for isolated functions/utilities) or an **End-to-End/Integration Test** (for API routes/workflows) would provide the most value for this specific change.
+5.  **Evaluate Testing (Code Only):** Check if the PR includes updates to test files. If core logic was changed or added without corresponding tests, flag it. Specifically recommend whether a **Unit Test** (for isolated functions/utilities) or an **End-to-End/Integration Test** (for API routes/workflows) would provide the most value for this specific change.
 6.  **Strictly Ignore:**
     *   Minor stylistic choices, formatting, or syntax preferences (assume a linter handles this).
     *   Changes to auto-generated files (e.g., package-lock.json, go.sum, compiled assets).
+    *   Nitpicky grammatical pedantry in docs (unless it genuinely impacts readability or technical understanding).
 
 Here is the context provided by the author:
 **PR Title:** %s
