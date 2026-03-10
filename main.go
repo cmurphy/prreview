@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -14,36 +15,44 @@ import (
 	"google.golang.org/api/option"
 )
 
-// parsePRURL extracts the owner, repo, and PR number from a standard GitHub PR URL.
+// --- Structs for GitHub JSON Responses ---
+
+type PRDetails struct {
+	Title string `json:"title"`
+	Body  string `json:"body"`
+}
+
+type CommitItem struct {
+	Commit struct {
+		Message string `json:"message"`
+	} `json:"commit"`
+}
+
+// --- Helper Functions ---
+
 func parsePRURL(prURL string) (owner, repo, prNumber string, err error) {
 	u, err := url.Parse(prURL)
 	if err != nil {
 		return "", "", "", fmt.Errorf("invalid URL: %v", err)
 	}
 
-	// Remove leading/trailing slashes and split
 	path := strings.Trim(u.Path, "/")
 	parts := strings.Split(path, "/")
 
 	if len(parts) < 4 || parts[2] != "pull" {
-		return "", "", "", fmt.Errorf("URL does not appear to be a valid GitHub Pull Request URL. Expected format: https://github.com/owner/repo/pull/123")
+		return "", "", "", fmt.Errorf("invalid GitHub PR URL format. Expected: https://github.com/owner/repo/pull/123")
 	}
 
 	return parts[0], parts[1], parts[3], nil
 }
 
-// getPRDiff fetches the raw diff text from the GitHub API.
-func getPRDiff(owner, repo, prNumber, token string) (string, error) {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%s", owner, repo, prNumber)
-
+func doGitHubRequest(apiURL, acceptHeader, token string) ([]byte, error) {
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	// The Accept header is required to get the raw diff
-	req.Header.Set("Accept", "application/vnd.github.v3.diff")
-
+	req.Header.Set("Accept", acceptHeader)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -51,28 +60,70 @@ func getPRDiff(owner, repo, prNumber, token string) (string, error) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusForbidden && strings.Contains(strings.ToLower(string(bodyBytes)), "rate limit") {
+		return nil, fmt.Errorf("GitHub API rate limit exceeded")
+	} else if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	return bodyBytes, nil
+}
+
+// --- GitHub Data Fetchers ---
+
+func getPRDiff(owner, repo, prNumber, token string) (string, error) {
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%s", owner, repo, prNumber)
+	bytes, err := doGitHubRequest(apiURL, "application/vnd.github.v3.diff", token)
+	if err != nil {
+		return "", err
+	}
+	return string(bytes), nil
+}
+
+func getPRMetadata(owner, repo, prNumber, token string) (PRDetails, error) {
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%s", owner, repo, prNumber)
+	bytes, err := doGitHubRequest(apiURL, "application/vnd.github.v3+json", token)
+
+	var details PRDetails
+	if err != nil {
+		return details, err
+	}
+
+	err = json.Unmarshal(bytes, &details)
+	return details, err
+}
+
+func getPRCommits(owner, repo, prNumber, token string) (string, error) {
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%s/commits", owner, repo, prNumber)
+	bytes, err := doGitHubRequest(apiURL, "application/vnd.github.v3+json", token)
+	if err != nil {
 		return "", err
 	}
 
-	bodyString := string(bodyBytes)
-
-	if resp.StatusCode == http.StatusForbidden && strings.Contains(strings.ToLower(bodyString), "rate limit") {
-		return "", fmt.Errorf("GitHub API rate limit exceeded. Try setting the GITHUB_TOKEN environment variable")
-	} else if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("error fetching PR (status %d): %s", resp.StatusCode, bodyString)
+	var commits []CommitItem
+	if err = json.Unmarshal(bytes, &commits); err != nil {
+		return "", err
 	}
 
-	return bodyString, nil
+	var messages []string
+	for _, c := range commits {
+		messages = append(messages, "- "+c.Commit.Message)
+	}
+	return strings.Join(messages, "\n"), nil
 }
 
-// generateReview sends the diff to Gemini and returns the feedback.
-func generateReview(ctx context.Context, diffText, apiKey string) (string, error) {
+// --- AI Generation ---
+
+func generateReview(ctx context.Context, details PRDetails, commits, diffText, apiKey string) (string, error) {
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
 		return "", fmt.Errorf("failed to create Gemini client: %v", err)
@@ -81,26 +132,35 @@ func generateReview(ctx context.Context, diffText, apiKey string) (string, error
 
 	model := client.GenerativeModel("gemini-2.5-pro")
 
+	// The prompt now includes all the rich context we fetched
 	prompt := fmt.Sprintf(`You are an expert senior software engineer. Please review the following code diff from a pull request.
-    
-Focus on:
+
+Here is the context provided by the author:
+**PR Title:** %s
+**PR Description:**
+%s
+
+**Commit Messages:**
+%s
+
+Focus your review on:
 1. Logic errors or bugs.
 2. Security vulnerabilities.
 3. Performance issues.
+4. Whether the code actually accomplishes what the PR description and commits claim it does.
 
 Do not nitpick minor stylistic changes. Format your response in clear bullet points that I can easily copy and paste into a GitHub review.
 
 Here is the diff:
-%s`, diffText)
+%s`, details.Title, details.Body, commits, diffText)
 
-	fmt.Println("Analyzing the diff with AI... (this might take a few seconds)\n")
+	fmt.Println("Analyzing the diff and context with AI... (this might take a few seconds)\n")
 
 	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
 		return "", fmt.Errorf("failed to generate content: %v", err)
 	}
 
-	// Safely extract the text from the response structure
 	if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
 		if textPart, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
 			return string(textPart), nil
@@ -113,12 +173,10 @@ Here is the diff:
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Printf("Usage: %s <github-pr-url>\n", os.Args[0])
-		fmt.Println("Example: pr-reviewer https://github.com/facebook/react/pull/28741")
 		os.Exit(1)
 	}
 
 	prURL := os.Args[1]
-
 	geminiKey := os.Getenv("GEMINI_API_KEY")
 	githubToken := os.Getenv("GITHUB_TOKEN")
 
@@ -126,20 +184,27 @@ func main() {
 		log.Fatal("Error: Please set the GEMINI_API_KEY environment variable.")
 	}
 
-	if githubToken == "" {
-		fmt.Println("Note: GITHUB_TOKEN is not set. You are limited to 60 GitHub API requests per hour.")
-	}
-
 	owner, repo, prNumber, err := parsePRURL(prURL)
 	if err != nil {
 		log.Fatalf("Error parsing URL: %v", err)
 	}
 
-	fmt.Printf("Fetching PR #%s from %s/%s...\n", prNumber, owner, repo)
+	fmt.Printf("Fetching data for PR #%s from %s/%s...\n", prNumber, owner, repo)
 
+	// Fetch all three pieces of context
 	diffText, err := getPRDiff(owner, repo, prNumber, githubToken)
 	if err != nil {
-		log.Fatalf("Error: %v", err)
+		log.Fatalf("Error fetching diff: %v", err)
+	}
+
+	details, err := getPRMetadata(owner, repo, prNumber, githubToken)
+	if err != nil {
+		log.Fatalf("Error fetching metadata: %v", err)
+	}
+
+	commits, err := getPRCommits(owner, repo, prNumber, githubToken)
+	if err != nil {
+		log.Fatalf("Error fetching commits: %v", err)
 	}
 
 	if strings.TrimSpace(diffText) == "" {
@@ -148,12 +213,12 @@ func main() {
 	}
 
 	ctx := context.Background()
-	reviewOutput, err := generateReview(ctx, diffText, geminiKey)
+	reviewOutput, err := generateReview(ctx, details, commits, diffText, geminiKey)
 	if err != nil {
 		log.Fatalf("AI Error: %v", err)
 	}
 
-	fmt.Println("--- AI Review Feedback ---")
+	fmt.Println("\n--- AI Review Feedback ---")
 	fmt.Println(reviewOutput)
 	fmt.Println("--------------------------")
 }
