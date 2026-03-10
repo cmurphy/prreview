@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -123,7 +124,7 @@ func getPRCommits(owner, repo, prNumber, token string) (string, error) {
 
 // --- AI Generation ---
 
-func generateReview(ctx context.Context, details PRDetails, commits, diffText, apiKey string) (string, error) {
+func generateReview(ctx context.Context, details PRDetails, commits, diffText, apiKey, customPrompt string) (string, error) {
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
 		return "", fmt.Errorf("failed to create Gemini client: %v", err)
@@ -132,7 +133,12 @@ func generateReview(ctx context.Context, details PRDetails, commits, diffText, a
 
 	model := client.GenerativeModel("gemini-2.5-pro")
 
-	// The prompt now includes all the rich context we fetched
+	// Conditionally inject the user's specific nudge
+	customInstructions := ""
+	if customPrompt != "" {
+		customInstructions = fmt.Sprintf("\n### SPECIAL INSTRUCTIONS FROM THE REVIEWER:\nPlease pay special attention to the following concern/question when reviewing this PR:\n\"%s\"\n", customPrompt)
+	}
+
 	prompt := fmt.Sprintf(`You are an expert Senior Software Engineer tasked with reviewing a pull request. Your goal is to provide constructive, actionable, and highly focused feedback.
 
 Your tone should be collaborative and objective. You are providing feedback to a human developer, so be respectful but direct.
@@ -160,7 +166,7 @@ Here is the context provided by the author:
 
 **Commit Messages:**
 %s
-
+%s
 ### OUTPUT FORMAT:
 Format your response in Markdown, using the following structure so I can easily copy/paste it into GitHub:
 
@@ -177,7 +183,7 @@ Format your response in Markdown, using the following structure so I can easily 
 If the PR looks excellent and has no notable issues, simply output: "LGTM! The code aligns with the description, tests are sufficient, and I see no security, performance, or logic issues."
 
 Here is the raw diff to review:
-%s`, details.Title, details.Body, commits, diffText)
+%s`, details.Title, details.Body, commits, customInstructions, diffText)
 
 	fmt.Println("Analyzing the diff and context with AI... (this might take a few seconds)\n")
 
@@ -196,12 +202,25 @@ Here is the raw diff to review:
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Printf("Usage: %s <github-pr-url>\n", os.Args[0])
+	// Define the optional flag
+	var customPrompt string
+	flag.StringVar(&customPrompt, "p", "", "Optional: Specific instructions or questions for the AI regarding this PR")
+	flag.StringVar(&customPrompt, "prompt", "", "Optional: Specific instructions or questions for the AI regarding this PR")
+
+	// Parse the flags
+	flag.Parse()
+
+	// After flags are parsed, flag.Args() holds the remaining non-flag arguments (the URL)
+	args := flag.Args()
+	if len(args) < 1 {
+		fmt.Printf("Usage: %s [flags] <github-pr-url>\n", os.Args[0])
+		fmt.Println("\nFlags:")
+		flag.PrintDefaults()
+		fmt.Println("\nExample: pr-reviewer -p \"Did they properly handle null values in the user payload?\" https://github.com/facebook/react/pull/28741")
 		os.Exit(1)
 	}
 
-	prURL := os.Args[1]
+	prURL := args[0]
 	geminiKey := os.Getenv("GEMINI_API_KEY")
 	githubToken := os.Getenv("GITHUB_TOKEN")
 
@@ -238,7 +257,7 @@ func main() {
 	}
 
 	ctx := context.Background()
-	reviewOutput, err := generateReview(ctx, details, commits, diffText, geminiKey)
+	reviewOutput, err := generateReview(ctx, details, commits, diffText, geminiKey, customPrompt)
 	if err != nil {
 		log.Fatalf("AI Error: %v", err)
 	}
