@@ -133,7 +133,25 @@ func generateReview(ctx context.Context, details PRDetails, commits, diffText, a
 	model := client.GenerativeModel("gemini-2.5-pro")
 
 	// The prompt now includes all the rich context we fetched
-	prompt := fmt.Sprintf(`You are an expert senior software engineer. Please review the following code diff from a pull request.
+	prompt := fmt.Sprintf(`You are an expert Senior Software Engineer tasked with reviewing a pull request. Your goal is to provide constructive, actionable, and highly focused feedback.
+
+Your tone should be collaborative and objective. You are providing feedback to a human developer, so be respectful but direct.
+
+I will provide you with the PR Title, the PR Description, the Commit Messages, and the raw Code Diff.
+
+### INSTRUCTIONS:
+1.  **Analyze Intent:** Read the PR Title, Description, and Commits first. Understand what the author is *trying* to accomplish.
+2.  **Dynamic Language Detection:** Identify the programming languages and frameworks being used based on the file paths and extensions in the diff. Apply the standard, recognized best practices and idiomatic patterns for those specific languages (e.g., idiomatic error handling in Go, Pythonic list comprehensions, or safe memory management in Rust).
+3.  **Review the Diff:** Evaluate the code changes against the author's stated intent. Does the code actually do what they claim?
+4.  **Focus on High-Impact Issues:**
+    *   Logic errors, race conditions, or unhandled edge cases.
+    *   Security vulnerabilities (e.g., injection flaws, poor data sanitization).
+    *   Significant performance bottlenecks.
+    *   Anti-patterns or deviations from standard language-specific conventions.
+5.  **Evaluate Testing:** Check if the PR includes updates to test files. If core logic was changed or added without corresponding tests, flag it. Specifically recommend whether a **Unit Test** (for isolated functions/utilities) or an **End-to-End/Integration Test** (for API routes/workflows) would provide the most value for this specific change.
+6.  **Strictly Ignore:**
+    *   Minor stylistic choices, formatting, or syntax preferences (assume a linter handles this).
+    *   Changes to auto-generated files (e.g., package-lock.json, go.sum, compiled assets).
 
 Here is the context provided by the author:
 **PR Title:** %s
@@ -143,15 +161,22 @@ Here is the context provided by the author:
 **Commit Messages:**
 %s
 
-Focus your review on:
-1. Logic errors or bugs.
-2. Security vulnerabilities.
-3. Performance issues.
-4. Whether the code actually accomplishes what the PR description and commits claim it does.
+### OUTPUT FORMAT:
+Format your response in Markdown, using the following structure so I can easily copy/paste it into GitHub:
 
-Do not nitpick minor stylistic changes. Format your response in clear bullet points that I can easily copy and paste into a GitHub review.
+**High-Level Summary**
+[1-2 sentences summarizing your overall impression of the PR and whether it achieves its goal safely.]
 
-Here is the diff:
+**Actionable Feedback**
+*   **[Severity: Critical/Moderate/Minor]** - **File: filename**: Explain the issue clearly. Mention if it violates a language-specific best practice. Provide a short snippet of the suggested fix if applicable.
+*   **[Question]** - If something is ambiguous, ask a clarifying question about the author's intent.
+
+**Testing & Validation**
+[Assess the test coverage in the PR. Clearly state if tests are missing for new logic, and recommend specifically what kind of test (Unit vs. E2E) should be written to validate the change safely.]
+
+If the PR looks excellent and has no notable issues, simply output: "LGTM! The code aligns with the description, tests are sufficient, and I see no security, performance, or logic issues."
+
+Here is the raw diff to review:
 %s`, details.Title, details.Body, commits, diffText)
 
 	fmt.Println("Analyzing the diff and context with AI... (this might take a few seconds)\n")
