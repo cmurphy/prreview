@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/google/generative-ai-go/genai"
+	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
@@ -379,10 +380,10 @@ Here are the configuration files:
 	return nil
 }
 
-func generateReview(ctx context.Context, details PRDetails, commits, diffText, apiKey, customPrompt, repoProfile, localContextText string) (string, error) {
+func generateReview(ctx context.Context, details PRDetails, commits, diffText, apiKey, customPrompt, repoProfile, localContextText string) error {
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
-		return "", fmt.Errorf("failed to create Gemini client: %v", err)
+		return fmt.Errorf("failed to create Gemini client: %v", err)
 	}
 	defer client.Close()
 
@@ -449,20 +450,30 @@ Here are the actual code changes. THIS IS THE ONLY CODE YOU ARE REVIEWING:
 If the PR looks excellent and has no notable issues, simply output: "LGTM! The code aligns with the description, tests are sufficient, and I see no security, performance, or logic issues."
 `, repoProfile, localContextText, details.Title, details.Body, commits, customInstructions, diffText)
 
-	fmt.Println("Analyzing the diff and context with AI... (this might take a few seconds)\n")
+	fmt.Println("Analyzing the diff and context with AI...")
+	fmt.Println("--------------------------------------------------")
 
-	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
-	if err != nil {
-		return "", fmt.Errorf("failed to generate content: %v", err)
-	}
+	iter := model.GenerateContentStream(ctx, genai.Text(prompt))
 
-	if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
-		if textPart, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
-			return string(textPart), nil
+	for {
+		resp, err := iter.Next()
+
+		// iterator.Done means the stream has finished successfully
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("streaming error: %v", err)
+		}
+		if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
+			if textPart, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
+				fmt.Print(string(textPart))
+			}
 		}
 	}
 
-	return "", fmt.Errorf("unexpected response format from Gemini API")
+	fmt.Println("\n--------------------------------------------------")
+	return nil
 }
 
 func main() {
@@ -552,12 +563,8 @@ func main() {
 	modifiedFiles := extractBaseFiles(diffText)
 	localContextText := fetchLocalContext(owner, repo, details.Base.Sha, githubToken, modifiedFiles)
 
-	reviewOutput, err := generateReview(ctx, details, commits, diffText, geminiKey, customPrompt, repoProfile, localContextText)
+	err = generateReview(ctx, details, commits, diffText, geminiKey, customPrompt, repoProfile, localContextText)
 	if err != nil {
 		log.Fatalf("AI Error: %v", err)
 	}
-
-	fmt.Println("\n--- AI Review Feedback ---")
-	fmt.Println(reviewOutput)
-	fmt.Println("--------------------------")
 }
