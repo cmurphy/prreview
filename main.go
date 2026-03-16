@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/generative-ai-go/genai"
@@ -291,7 +292,7 @@ func fetchLocalContext(owner, repo, baseSHA, token string, files []string) strin
 		// Use the raw media type so GitHub returns plain text instead of base64 JSON
 		bytesData, err := doGitHubRequest(apiURL, "application/vnd.github.v3.raw", token)
 		if err != nil {
-			fmt.Printf("Notice: Could not fetch base file %s (it might be too large or deleted).\n", file)
+			fmt.Printf("Notice: Could not fetch base file %s (error: %v).\n", file, err)
 			continue
 		}
 
@@ -417,7 +418,7 @@ Here are the configuration files:
 	return nil
 }
 
-func generateReview(ctx context.Context, details PRDetails, commits, diffText, apiKey, customPrompt, repoProfile, localContextText string) error {
+func generateReview(ctx context.Context, details PRDetails, commits, diffText, apiKey, customPrompt, repoProfile, localContextText string, numDrafts uint) error {
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
 		return fmt.Errorf("failed to create Gemini client: %v", err)
@@ -432,7 +433,7 @@ func generateReview(ctx context.Context, details PRDetails, commits, diffText, a
 		customInstructions = fmt.Sprintf("\n### SPECIAL INSTRUCTIONS FROM THE REVIEWER:\nPlease pay special attention to the following concern/question when reviewing this PR:\n\"%s\"\n", customPrompt)
 	}
 
-	prompt := fmt.Sprintf(`You are an expert Senior Software Engineer and Technical Writer reviewing a pull request. Your goal is to provide constructive, actionable, and highly focused feedback.
+	basePrompt := fmt.Sprintf(`You are an expert Senior Software Engineer and Technical Writer reviewing a pull request. Your goal is to provide constructive, actionable, and highly focused feedback.
 
 Your tone should be collaborative and objective. You are providing feedback to a human developer, so be respectful but direct.
 
@@ -487,32 +488,130 @@ Here are the actual code changes. THIS IS THE ONLY CODE YOU ARE REVIEWING:
 If the PR looks excellent and has no notable issues, simply output: "LGTM! The code aligns with the description, tests are sufficient, and I see no security, performance, or logic issues."
 `, repoProfile, localContextText, details.Title, details.Body, commits, customInstructions, diffText)
 
+	// --- PATH A: Fast Single-Pass Review (Cost/Time Efficient) ---
+	if numDrafts == 1 {
+		fmt.Println("\n--------------------------------------------------")
+		spinner := StartSpinner("AI is analyzing the PR...")
+
+		iter := model.GenerateContentStream(ctx, genai.Text(basePrompt))
+
+		firstTokenReceived := false
+		for {
+			resp, err := iter.Next()
+
+			// iterator.Done means the stream has finished successfully
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				if !firstTokenReceived {
+					spinner.Stop()
+				}
+				return fmt.Errorf("streaming error: %v", err)
+			}
+
+			// The moment we get our first piece of data, stop the spinner
+			if !firstTokenReceived {
+				spinner.Stop()
+				firstTokenReceived = true
+			}
+
+			if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
+				if textPart, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
+					fmt.Print(string(textPart))
+				}
+			}
+		}
+
+		fmt.Println("\n--------------------------------------------------")
+		return nil
+	}
+
+	// --- PATH B: Concurrent Ensemble Review (High Quality / High Recall) ---
 	fmt.Println("\n--------------------------------------------------")
-	spinner := StartSpinner("AI is analyzing the PR...")
+	aiSpinner := StartSpinner(fmt.Sprintf("AI ensemble (%d drafts) is analyzing the PR concurrently...", numDrafts))
 
-	iter := model.GenerateContentStream(ctx, genai.Text(prompt))
+	drafts := make([]string, numDrafts)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var fetchErr error
 
-	firstTokenReceived := false
+	for i := uint(0); i < numDrafts; i++ {
+		wg.Add(1)
+		go func(index uint) {
+			defer wg.Done()
+
+			// Use a separate model instance for the concurrent calls
+			draftModel := client.GenerativeModel("gemini-2.5-pro")
+			resp, err := draftModel.GenerateContent(ctx, genai.Text(basePrompt))
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if err != nil {
+				fetchErr = err
+				return
+			}
+			if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
+				if textPart, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
+					drafts[index] = string(textPart)
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	aiSpinner.Stop()
+
+	if fetchErr != nil {
+		return fmt.Errorf("ensemble analysis failed: %v", fetchErr)
+	}
+
+	// Build the Synthesis Prompt dynamically based on how many drafts were requested
+	var draftsContent strings.Builder
+	for i, draft := range drafts {
+		draftsContent.WriteString(fmt.Sprintf("<draft_%d>\n%s\n</draft_%d>\n\n", i+1, draft, i+1))
+	}
+
+	mergeSpinner := StartSpinner("Synthesizing and deduplicating final report...")
+
+	synthesisPrompt := fmt.Sprintf(`You are a Lead Staff Engineer reviewing a Pull Request.
+I have asked %d Senior Engineers to independently review the same PR. Here are their draft reports:
+
+%s
+
+Your job is to merge these drafts into a single, cohesive, master review.
+
+### STRICT INSTRUCTIONS:
+1.  **Deduplicate:** Semantically combine identical findings. Do not repeat the same issue twice.
+2.  **Filter Noise:** If one draft hallucinates an issue that is factually incorrect or contradicts the other drafts, discard it.
+3.  **Consolidate:** Keep the tone collaborative, objective, and direct.
+
+### OUTPUT FORMAT:
+Output using the exact same format as the drafts:
+**High-Level Summary**
+**Actionable Feedback** (Grouped logically)
+**Testing & Validation**
+`, numDrafts, draftsContent.String())
+
+	iter := model.GenerateContentStream(ctx, genai.Text(synthesisPrompt))
+	firstToken := false
+
 	for {
 		resp, err := iter.Next()
-
-		// iterator.Done means the stream has finished successfully
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
-			if !firstTokenReceived {
-				spinner.Stop()
+			if !firstToken {
+				mergeSpinner.Stop()
 			}
 			return fmt.Errorf("streaming error: %v", err)
 		}
-
-		// The moment we get our first piece of data, stop the spinner
-		if !firstTokenReceived {
-			spinner.Stop()
-			firstTokenReceived = true
+		if !firstToken {
+			mergeSpinner.Stop()
+			firstToken = true
 		}
-
 		if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
 			if textPart, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
 				fmt.Print(string(textPart))
@@ -527,8 +626,10 @@ If the PR looks excellent and has no notable issues, simply output: "LGTM! The c
 func main() {
 	// Define the optional flag
 	var customPrompt string
+	var drafts uint
 	flag.StringVar(&customPrompt, "p", "", "Optional: Specific instructions or questions for the AI regarding this PR")
 	flag.StringVar(&customPrompt, "prompt", "", "Optional: Specific instructions or questions for the AI regarding this PR")
+	flag.UintVar(&drafts, "drafts", 1, "Optional: Number of AI iterations to run to synthesize feedback (increases costs)")
 
 	// Parse the flags
 	flag.Parse()
@@ -539,7 +640,7 @@ func main() {
 		fmt.Printf("Usage: %s [flags] <github-pr-url>\n", os.Args[0])
 		fmt.Println("\nFlags:")
 		flag.PrintDefaults()
-		fmt.Println("\nExample: prreview -p \"Did they properly handle null values in the user payload?\" https://github.com/facebook/react/pull/28741")
+		fmt.Println("\nExample: prreview -p \"Did they properly handle null values in the user payload?\" --drafts 3 https://github.com/facebook/react/pull/28741")
 		os.Exit(1)
 	}
 
@@ -580,7 +681,7 @@ func main() {
 	if cachedProfile, err := os.ReadFile(profilePath); err == nil {
 		repoProfile = string(cachedProfile)
 	} else {
-		fmt.Printf("⚠️ No Codebase Profile found. Run 'pr-reviewer init %s' to create one for better reviews.\n\n", "https://github.com/"+owner+"/"+repo)
+		fmt.Printf("⚠️ No Codebase Profile found. Run 'prreview init %s' to create one for better reviews.\n\n", "https://github.com/"+owner+"/"+repo)
 		repoProfile = "No specific repository rules provided. Apply general best practices."
 	}
 
@@ -613,7 +714,7 @@ func main() {
 	spinner.Stop()
 	fmt.Println("✅ Local file context fetched.")
 
-	err = generateReview(ctx, details, commits, diffText, geminiKey, customPrompt, repoProfile, localContextText)
+	err = generateReview(ctx, details, commits, diffText, geminiKey, customPrompt, repoProfile, localContextText, drafts)
 	if err != nil {
 		log.Fatalf("AI Error: %v", err)
 	}
