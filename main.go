@@ -222,7 +222,7 @@ func main() {
 		fmt.Printf("Usage: %s [flags] <github-pr-url>\n", os.Args[0])
 		fmt.Println("\nFlags:")
 		flag.PrintDefaults()
-		fmt.Println("\nExample: pr-reviewer -p \"Did they properly handle null values in the user payload?\" https://github.com/facebook/react/pull/28741")
+		fmt.Println("\nExample: prreview -p \"Did they properly handle null values in the user payload?\" https://github.com/facebook/react/pull/28741")
 		os.Exit(1)
 	}
 
