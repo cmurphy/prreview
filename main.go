@@ -183,6 +183,9 @@ Format your response in Markdown, using the following structure so I can easily 
 **Testing & Validation**
 [Assess the test coverage in the PR. Clearly state if tests are missing for new logic, and recommend specifically what kind of test (Unit vs. E2E) should be written to validate the change safely.]
 
+**Other Notes**
+[Add your private notes about the reviewer's concern or question provided in the special instructions, if such instructions were given.]
+
 If the PR looks excellent and has no notable issues, simply output: "LGTM! The code aligns with the description, tests are sufficient, and I see no security, performance, or logic issues."
 
 Here is the raw diff to review:
