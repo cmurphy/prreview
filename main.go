@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/iterator"
@@ -34,6 +35,42 @@ type CommitItem struct {
 	Commit struct {
 		Message string `json:"message"`
 	} `json:"commit"`
+}
+
+// Spinner represents a simple, zero-dependency terminal loading indicator
+type Spinner struct {
+	stopChan chan struct{}
+}
+
+// StartSpinner begins the background animation with a message
+func StartSpinner(message string) *Spinner {
+	s := &Spinner{stopChan: make(chan struct{})}
+
+	go func() {
+		// Braille spinner frames for a smooth circle
+		frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+		i := 0
+		for {
+			select {
+			case <-s.stopChan:
+				return
+			default:
+				// \r moves the cursor to the start of the line so it overwrites itself
+				fmt.Printf("\r\033[36m%s\033[m %s", frames[i], message)
+				time.Sleep(100 * time.Millisecond)
+				i = (i + 1) % len(frames)
+			}
+		}
+	}()
+
+	return s
+}
+
+// Stop halts the animation and clears the line for the final output
+func (s *Spinner) Stop() {
+	close(s.stopChan)
+	// \033[2K clears the entire current line, \r resets the cursor
+	fmt.Printf("\r\033[2K")
 }
 
 // --- Helper Functions ---
@@ -450,11 +487,12 @@ Here are the actual code changes. THIS IS THE ONLY CODE YOU ARE REVIEWING:
 If the PR looks excellent and has no notable issues, simply output: "LGTM! The code aligns with the description, tests are sufficient, and I see no security, performance, or logic issues."
 `, repoProfile, localContextText, details.Title, details.Body, commits, customInstructions, diffText)
 
-	fmt.Println("Analyzing the diff and context with AI...")
-	fmt.Println("--------------------------------------------------")
+	fmt.Println("\n--------------------------------------------------")
+	spinner := StartSpinner("AI is analyzing the PR...")
 
 	iter := model.GenerateContentStream(ctx, genai.Text(prompt))
 
+	firstTokenReceived := false
 	for {
 		resp, err := iter.Next()
 
@@ -463,8 +501,18 @@ If the PR looks excellent and has no notable issues, simply output: "LGTM! The c
 			break
 		}
 		if err != nil {
+			if !firstTokenReceived {
+				spinner.Stop()
+			}
 			return fmt.Errorf("streaming error: %v", err)
 		}
+
+		// The moment we get our first piece of data, stop the spinner
+		if !firstTokenReceived {
+			spinner.Stop()
+			firstTokenReceived = true
+		}
+
 		if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
 			if textPart, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
 				fmt.Print(string(textPart))
@@ -559,9 +607,11 @@ func main() {
 		os.Exit(0)
 	}
 
-	fmt.Println("Fetching local file context for the modified files...")
+	spinner := StartSpinner("Fetching local file context for the modified files...")
 	modifiedFiles := extractBaseFiles(diffText)
 	localContextText := fetchLocalContext(owner, repo, details.Base.Sha, githubToken, modifiedFiles)
+	spinner.Stop()
+	fmt.Println("✅ Local file context fetched.")
 
 	err = generateReview(ctx, details, commits, diffText, geminiKey, customPrompt, repoProfile, localContextText)
 	if err != nil {
