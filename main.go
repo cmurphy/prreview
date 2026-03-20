@@ -22,6 +22,8 @@ import (
 	"google.golang.org/api/option"
 )
 
+const modelVersion = "gemini-3.1-pro-preview"
+
 // --- Structs for GitHub JSON Responses ---
 
 type PRDetails struct {
@@ -386,7 +388,7 @@ Here are the configuration files:
 	}
 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-2.5-pro")
+	model := client.GenerativeModel(modelVersion)
 	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
 		return err
@@ -425,7 +427,7 @@ func generateReview(ctx context.Context, details PRDetails, commits, diffText, a
 	}
 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-2.5-pro")
+	model := client.GenerativeModel(modelVersion)
 
 	// Conditionally inject the user's specific nudge
 	customInstructions := ""
@@ -542,7 +544,7 @@ If the PR looks excellent and has no notable issues, simply output: "LGTM! The c
 			defer wg.Done()
 
 			// Use a separate model instance for the concurrent calls
-			draftModel := client.GenerativeModel("gemini-2.5-pro")
+			draftModel := client.GenerativeModel(modelVersion)
 			resp, err := draftModel.GenerateContent(ctx, genai.Text(basePrompt))
 
 			mu.Lock()
